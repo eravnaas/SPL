@@ -1,0 +1,1171 @@
+#+TITLE: SPL - a Simple Programming Language
+#+AUTHOR: Eirik Ravnås
+
+* Introduction
+This is a series of experiments building up to producing a FORTH like language
+in x86 assembly and perhaps as well in C.
+
+The idea here is to proceed development in an interactive way. That is write small
+assembly programs that work and can be tested proceeding towards the programming
+language itself. It is more fun to do it this way!
+
+** Platform
+The following examples were tested on a Linux Mint 10 distribution running
+the following kernel version 2.6.35-22.
+#+begin_src sh
+echo "Kernel version: `uname r`"
+#+end_src
+
+* Short overview of x386 architecture
+
+** Registers
+|----------+-------------+--------------+-----------------+------------------|
+| Register | Size (bits) | Parts        | Register Class  | Purpose          |
+|----------+-------------+--------------+-----------------+------------------|
+| eax      |          32 | ax (ah , al) | General purpose | Accumulator      |
+| ebx      |          32 | bx (bh, bl)  | General purpose | Base register    |
+| ecx      |          32 | cx (ch, cl)  | General purpose | Counter register |
+| edx      |          32 | dx (dh, dl)  | General purpose | Data register    |
+| esi      |          32 | si           | Index           | pointer          |
+| edi      |          32 | di           | Index           | pointer          |
+| ebp      |          32 |              | Stack           | Base pointer     |
+| esp      |          32 |              | Stack           | Stack pointer    |
+| eflags   |          32 |              | Flags           | flags            |
+| cs       |          16 |              | segment         | code segment     |
+| ds       |          16 |              | segment         | data segment     |
+| ss       |          16 |              | segment         | stack segment    |
+| es       |          16 |              | segment         | extra segment    |
+| fs       |          16 |              | segment         | extra segment    |
+| gs       |          16 |              | segment         | extra segment    |
+|----------+-------------+--------------+-----------------+------------------|
+
+*** General purpose registers
+All of the general purpose registers are available for addressing 
+calculations and for the results of most calculations. However, a number 
+of functions expect there data to be in specific registers. This allows 
+for more compact and efficient instructions. 
+
+*** Index registers
+Used as pointers.
+
+*** Segement registers
+Segment registers denote what memory is used for different parts of the program.
+We will generally not worry about the values of these registers.
+
+*** Stack registers
+The 80386 allows for multiple stacks, with each stack being a separate segment. 
+The stack pointer (ESP) register points to the top of the stack. The stack 
+is a push-down stack, and is referenced implicitly by PUSH and POP instructions, 
+subroutine calls and returns and interrupt opraptortions. When an item is pushed
+on the stack, ESP is first decremented, then the data is written to the new ESP 
+location. The opposite occurs when data is popped off the stack. The data is 
+first copied out of the stack, then the ESP is incremented. The stack grows 
+down in memory toward lesser addresses.
+
+The stack frame base pointer (EBP) register is the best register to use for 
+accessing data within the stack. It typically identifies the base address 
+of the current stack frame in use by the current procedure. When this 
+register is used in an offset calculation, the data is automatically
+fetched from the stack segment. This means the stack segment does not have 
+to be included in the instruction, making for a more compact instruction.
+
+*** Flags Register
+
+The flags register is a 32-bit register named EFLAGS. The low-order 16 bits 
+of EFLAGS is named FLAGS for compatibility with older 8086 and 80286 code. 
+There are three basic groups of flags, status flags, control flags and the 
+system flags. The flags are as follows:
+
+|-------+-------+--------------------------------|
+|   Bit | Label | Desciption                     |
+|-------+-------+--------------------------------|
+|     0 | CF    | Carry flag                     |
+|     2 | PF    | Parity flag                    |
+|     4 | AF    | Auxiliary carry flag           |
+|     6 | ZF    | Zero flag                      |
+|     7 | SF    | Sign flag                      |
+|     8 | TF    | Trap flag                      |
+|     9 | IF    | Interrupt enable flag          |
+|    10 | DF    | Direction flag                 |
+|    11 | OF    | Overflow flag                  |
+| 12-13 | IOPL  | I/O Priviledge level           |
+|    14 | NT    | Nested task flag               |
+|    16 | RF    | Resume flag                    |
+|    17 | VM    | Virtual 8086 mode flag         |
+|    18 | AC    | Alignment check flag (486+)    |
+|    19 | VIF   | Virutal interrupt flag         |
+|    20 | VIP   | Virtual interrupt pending flag |
+|    21 | ID    | ID flag                        |
+|-------+-------+--------------------------------|
+
+The remaining bits are reserved for future Intel use. A flag is considered 
+cleared when it is zero, set when it is 1.
+
+The status flags used by application programmers are CF, PF, AF, ZF, SF, and 
+OF. These flags hold the results of various instructions that are then used 
+by later instructions. What follows is a brief description of each flag.
+
+- Carry Flag: Set in math instructions to indicate that the high-order bit 
+was either carried or borrowed. It is cleared if neither of these 
+conditions occur. - Parity Flag: Indicates whether the lower 8-bits of a 
+result contains an even number of bits set to 1 (flag is set) or an odd set 
+of bits are set to 1 (flag is cleared) 
+- Adjust Flag: Set in decimal math instructions to indicate whether the 
+low order 4-bits of AL where carried, or borrowed. It is cleared if not.
+- Zero Flag:Set to indicate a math instruction resulted in a zero result. 
+It is cleared otherwise. It is also used by string and loop instructions 
+to indicate completion of the instruction.
+- Sign Flag:Set equal to high-order bit of results of math instruction. 
+If set the result is negative, positive if cleared.
+- Overflow Flag:Indicates if the number placed in the destination operation 
+overflowed, either too large, or small. If no overflow occurred, the bit is 
+cleared.
+
+The only control flag at this time is the Direction Flag. It is used by string 
+instructions to determine whether to process strings from the end of the 
+string (auto-decrement), or from the beginning of the string (auto-increment).
+
+The other flags are system flags. Refer to the 80386 Programmers guide for 
+further information on these flags.
+
+*** Instruction Pointer
+The instruction pointer register (EIP) contains the offset into the current code segment.
+It is a 32-bit value. The lower 16-bit field is addressable as a single unit for backwards
+compatibility, and is named IP. The programmer should not fiddle with this register. It is
+controlled by instructions that transfer control of the program such as jump instructions,
+interrupts, and exceptions.
+
+* Input and output
+In this chapter we shall experiment with some input/output functionality.
+If we don't have this in place, it gets boring quite quickly...
+
+** Hello world! 
+Let's us start with getting the basics up and running. We shall use NASM as our
+assembler. How do we do input and output from a linux terminal? Let us begin with
+input. The below code shows a hello world program in assembly:
+#+srcname: hello_world 
+#+begin_src asm :tangle src/hello.asm :noweb yes
+  section .text                           ;section declaration
+  
+                                  ;we must export the entry point to the ELF linker or
+          global _start       ;loader. They conventionally recognize _start as their
+                                  ;entry point. Use ld -e foo to override the default.
+  
+  _start:
+  
+          ;write our string to stdout
+  
+          mov     edx,len ;third argument: message length
+          mov     ecx,msg ;second argument: pointer to message to write
+          mov     ebx,1   ;first argument: file handle (stdout)
+          mov     eax,4   ;system call number (sys_write)
+          int     0x80    ;call kernel
+  
+          ;and exit
+  
+          mov     ebx,0   ;first syscall argument: exit code
+          mov     eax,1   ;system call number (sys_exit)
+          int     0x80    ;call kernel
+  
+  section .data                           ;section declaration
+  
+          msg     db      "Hello, world!",0xa     ;our dear string
+          len     equ     $ - msg                 ;length of our dear string
+#+end_src 
+Now lets compile it by executing the following shell command:
+#+begin_src sh 
+  cd src
+  nasm -f elf64 hello.asm
+  ld -s -o hello hello.o
+  ./hello
+  cd ..
+#+end_src
+
+#+results:
+| Hello | world! |
+
+First of all we need to know about sections. Different type of data should
+be placed in diffent sections;
+| section | Description                                                     |
+|---------+-----------------------------------------------------------------|
+| .text   | should contain only code                                        |
+| .data   | should contain constants (data that does not change at runtime) |
+| .bss    | should contain variables (data that does change at runtime)     |
+|---------+-----------------------------------------------------------------|
+The next thing to notice is the *global* word. It tells the system where
+the entry point for the program is (like c's main function).
+The next is to know that output is handled by setting up some machine registers
+with information, then calling a software interrupt which calls interrupt
+routines implemented in the operating system (here linux) to do useful stuff.
+In the above code there are two such operations; the first is to print a string
+to standard output (terminal), and the second is to exit the program by returning
+0 (which tells the operating system that the program exited correctly). If a program
+exists by some fault, we should use a number other than 0 as an error code.  
+These are the most important stuff to be learned from the hello world example, the
+rest is basically about knowing your CPU and NASM syntax. 
+
+The equivalent (with respect to result) code in C is given below:
+#+srcname: hello_world 
+#+begin_src c :tangle src/helloc.c :noweb yes
+  #include <stdio.h>
+  
+  int main()
+  {
+     printf("Hello World!\n");
+  }
+#+end_src
+It can be compiled and run with:
+#+begin_src sh 
+  cd src
+  gcc -o helloc.out helloc.c
+  ./helloc.out
+  cd ..
+#+end_src
+
+
+** System calls
+Currently we are able to write strings to a terminal window, but how to read 
+an input stream or do other things provided by the linux kernel? 
+Numbers are listed in [[/usr/include/asm/unistd.h]] in Linux. To figure out what arguments
+each syscall take, and what values they return look no further than the man
+pages. For example, the following command in the terminal looks up read
+functionality:
+#+begin_src sh 
+man 2 read
+#+end_src
+And the following command gives a list of all syscalls in the system:
+#+begin_src sh 
+man 2 syscalls
+#+end_src
+
+Below we shall give an overview of system calls that will be used in this program.
+This is basically a subset of the table found at [[http://bluemaster.iu.hio.no/edu/dark/lin-asm/syscalls.html]].
+Note that the return value from the system call is placed in eax.
+#Add to this list as we proceed
+| eax | Name      | Source          | ebx          | ecx          | edx    | esx | edi |
+|-----+-----------+-----------------+--------------+--------------+--------+-----+-----|
+|   1 | sys exit  | kernel/exit.c   | int          | -            | -      | -   | -   |
+|   3 | sys read  | fs/read_write.c | unsigned int | char *       | size_t | -   | -   |
+|   4 | sys write | fs/read_write.c | unsigned int | const char * | size_t | -   | -   |
+|   5 | sys open  | fs/open.c       | const char * | int          | int    | -   | -   |
+|   6 | sys close | fs/open.c       | unsigned int | -            | -      | -   | -   |
+|   8 | sys creat | fs/open.c       | const char * | int          | int    | -   | -   |
+|-----+-----------+-----------------+--------------+--------------+--------+-----+-----|
+
+The above table complies with kernel version 2.2 of linux.
+We have not included semantics of each variable. One thing to keep in mind
+when you open a manual page, is that the sequence of arguments in the c-function
+described there reflects the sequence of arguments in the registers (starting at
+ebx...) 
+
+We shall go through with disecting the system calls in our 'hello world' example.
+The first system call we meet is to write a string to the terminal.
+We set it up as follows:
+: TABLE_ID 
+| Register | Value | Description                                         |
+|----------+-------+-----------------------------------------------------|
+| eax      | 4     | sys_write                                           |
+| ebx      | 1     | file handle (standard output)                       |
+| ecx      | msg   | a pointer to the beginning of string (0 terminated) |
+| edx      | len   | length of string in bytes                           |
+|----------+-------+-----------------------------------------------------|
+
+Now looking at the manual page we see that the c-function is defined as
+#+begin_src c 
+ssize_t write(int fd, const void *buf, size_t count)ssize_t write(int fd, const void *buf, size_t count);
+#+end_src
+The only question left is how we knew to put 1 in ebx. 
+Well it turns out that a POSIX system have 3 standard file descriptors:
+| Integer value | Name            |
+|---------------+-----------------|
+|             0 | Standard input  |
+|             1 | Standard output |
+|             2 | Standard error  |
+|---------------+-----------------|
+Unlike other file descriptors (such as reading or writing to actuator files), these
+need not be opened and closed. We will go into reading and writing from/to files
+in a later section.
+
+
+** Echoing a character
+We shall write a small program which echo's characters in the input stream until 
+the character 'q' is written, upon which the program will exit.
+#+srcname: echo
+#+begin_src asm :tangle src/echo.asm :noweb yes                                          
+section .text                           ;section declaration
+
+                                ;we must export the entry point to the ELF linker or
+        global _start       ;loader. They conventionally recognize _start as their
+                                ;entry point. Use ld -e foo to override the default.
+
+_start:
+
+        ;; welcome message
+        mov edx,len ;third argument: message length
+        mov ecx,msg ;second argument: pointer to message to write
+        mov ebx,1   ;first argument: file handle (stdout)
+        mov eax,4   ;system call number (sys_write)
+        int 0x80    ;call kernel
+
+_read:  
+        ;; read a character stream into a buffer
+        mov eax, 3 ; sys_read
+        mov ebx, 0 ; standard input file descriptor
+        mov ecx, buffer                                     ;buffer
+        mov edx, 1 ;length of input stream accepted
+        int 0x80
+
+        mov edx, [buffer]
+        mov eax, 'q'
+        cmp ax,dx
+        jz  _exit0
+        mov [buffer], dx
+
+        mov edx,1 ;third argument: message length
+        mov ecx,buffer ;second argument: pointer to message to write
+        mov ebx,1   ;first argument: file handle (stdout)
+        mov eax,4   ;system call number (sys_write)
+        int 0x80    ;call kernel
+        jmp  _read
+
+_exit0: 
+        mov     ebx,0   ;first syscall argument: exit code
+        mov     eax,1   ;system call number (sys_exit)
+        int     0x80    ;call kernel
+
+section .data                           ;section declaration
+
+        msg     db      "Echo program (quit by pressing 'q'):",0xa     ;our dear string
+        len     equ     $ - msg                 ;length of our dear string
+
+section .bss
+
+        buffer  resb 1 
+        
+#+end_src
+Now lets compile it by executing the following shell command:
+#+begin_src sh 
+  cd src
+  nasm -f elf64 echo.asm
+  ld -s -o echo echo.o
+  ./hello
+  cd ..
+#+end_src
+If you run this program you will realise that the terminal itself seem to buffer up characters. Therefore, if
+you type in 'abc' and press enter, the program will write 'abc' out and not only 'a'. Currently I don't know
+how big this buffer is though.
+
+Again we list an equivalen c program.
+#+srcname: echo_c 
+#+begin_src c :tangle src/echoc.c :noweb yes
+  #include <stdio.h>
+  int main()
+  {
+     printf("This program echos input until the character 'q' is pressed:\n");
+     int ch;
+     for(;;)
+     {
+        ch = getchar();
+        if (ch == 'q')
+        {
+           break;
+        }
+        putchar(ch);
+     }
+     return 0;
+  }
+    
+#+end_src
+It can be compiled with:
+#+begin_src sh 
+  cd src
+  gcc -o echoc.out echoc.c
+  cd ..
+#+end_src
+It might be interesting to view the assembly code produced by gcc here (note the
+assembly listing will use GAS syntax), this can be done by the following command:
+#+begin_src sh 
+  cd src
+  gcc -S echoc.c
+  cat echoc.s
+  cd ..
+#+end_src
+Or, more verbose by
+#+begin_src sh 
+  cd src
+  gcc -c -g -Wa,-ahl=echoc.s echoc.c
+  cat echoc.s
+  cd ..
+#+end_src
+This is nice to do, but the output wasn't interesting enough 
+to include here.
+
+** Reading and writing to/from files
+Next we shall write a function to copy a file. Here we shall also use command line arguments.
+Suppose we have written an assembly program which is called by './program 42 A'.
+Then at the start of the assembly program the stack will look like (top element at the top of the figure).
+#+begin_ditaa cmdlinestack.png -r -o -S
+        +---------+
+	| 2       |	The number of arguments, including argv[0], 
+	|	  |	which is the program name
+	+---------+
+	|"program"|	argv[0] (actually a pointer to the string) 
+	+---------+
+	| "42"    |	argv[1] NOTE: This is the character "4" and "2",
+	|	  |     not the number 42
+	+---------+
+	| "A"     |	argv[2]
+	+---------+
+#+end_ditaa
+The program we want to make takes as input a path to the source file and a destination file. The stack at 
+startup should therefore look like:
+#+begin_ditaa filecopystack.png -r -o -S
+        +----------+
+	| 2        |	The number of arguments, including argv[0], 
+	|	   |	which is the program name
+	+----------+
+	|"filecopy"|	argv[0] (actually a pointer to the string) 
+	+----------+
+	| "file1"  |	argv[1] (pointer) 
+        +----------+
+	| "file2"  |	argv[2] (pointer)
+	+----------+
+#+end_ditaa
+
+Unlike when we use standard input/output/error
+we now need to open files for reading and writing, 
+and close them when we are done. Additionally, we may
+not have access to the file.. etc, so we should check for
+errors as well.
+
+By looking at the man page, we see the following system call (c function):
+#+begin_src c 
+int open(const char *pathname, int flags);
+int open(const char *pathname, int flags, mode_t mode);
+int creat(const char *pathname, mode_t mode);
+#+end_src
+The argument flags must include one of the following access modes; O_RDONLY, O_WRONLY, or O_RDWR 
+(read-only, write-only, read/write..). In addition, zero or more file creation flags
+can be bitwise-or'd in flags. We shall use the O_CREAT, which will cause a file
+to be created if a file with the specified name does not exist.
+Open() and creat() return the new file descriptor (a small positive integer), or 
+-1 in case of fault. But wait a minute! Where does the assembly code obtain the return
+value? Well, in eax (this is always the case with system calls). To figure out the number behind the various
+flags, look in [[/usr/include/asm-generic/fcntl.h]]. This file is referenced from the
+man page. The mode#_t argument must be given when the O_CREAT flag is set. Mode_t argument sets read, write
+and execute permissions for the file created. The below code also contains a primitive macro used for debugging
+the example below.
+
+#+srcname: filecopy
+#+begin_src asm :tangle src/filecopy.asm :noweb yes                                          
+  %macro    dbg 0
+            mov edx,len5 ;third argument: message length
+            mov ecx,msg5 ;second argument: pointer to message to write
+            mov ebx,1   ;first argument: file handle (stdout)
+            mov eax,4   ;system call number (sys_write)
+            int 0x80    ;call kernel
+  %endmacro
+    
+  section .text                           ;section declaration
+      
+                                      ;we must export the entry point to the ELF linker or
+              global _start       ;loader. They conventionally recognize _start as their
+                                      ;entry point. Use ld -e foo to override the default.
+      
+  _start:
+              ;; Fist let's take care of the stack
+              pop ebx                                             ;argc 
+              ;; we check that the number of arguments are 2 (file1 file2), otherwise just exit (no error message sent).
+              cmp ebx, 2
+              je  _exit0                                          ;jump if equal
+              pop ebx                                             ;program name (irrelevant)
+              pop ebx                                             ; file 1
+              
+              ;; now open it
+              mov eax, 5                                          ;system call open
+              mov ecx, 0                                          ; O_RDONLY 
+              int 80h                                             ; call kernel
+      
+              ;; Now we need to check that the value returned in eax is valid (not negative)
+              ;; to do this we can use the TEST instruction basically performs an AND operation without modifying registers other than flag registers. By writing test eax, eax, the signed flag should be set if -1 was returned to eax.
+              test eax, eax
+              js   _failopen1                                         ;if signed - just exit
+              ;; otherwise ensure to save the file descriptor
+              mov [file1], eax
+              ;; Now we open the next file, with the same procedure
+              pop ebx                                             ; file 2
+              
+              ;; now open it
+              mov eax, 5                                          ;system call open
+              mov ecx, 1                                          ; O_WRONLY 
+              or  ecx, 100                                        ; O_CREAT
+              mov edx, 777                                        ; all permissions granted
+              int 80h                                             ; call kernel
+      
+              test eax, eax
+              js   _failopen2                                         ;if signed - just close the first file and exit
+              mov [file2], eax
+      
+  _filecopy:       
+            ;; read a character stream into a buffer
+            mov eax, 3 ; sys_read
+            mov ebx, [file1] ; file descriptor
+            mov ecx, buffer                                     ;buffer
+            mov edx, 1 ;length of input stream accepted
+            int 0x80
+      
+            ;; Now eax contains the number of characters read, so if eax
+            ;; contains 0 we have copied the entire file and can exit
+            test eax, eax
+            js   _failread
+            jz   _close2
+              ;; write the character
+      
+            mov eax,4   ;system call number (sys_write)
+            mov ebx,[file2]   
+            mov ecx,buffer ;second argument: pointer to message to write
+            mov edx,1 ;third argument: message length
+            int 0x80    ;call kernel
+  
+            test eax, eax
+            js  _failwrite
+            jmp _filecopy              
+      
+  _close2:
+             mov eax, 6                                          ;sys_close
+             mov ebx, [file2]
+             int 0x80
+             dbg  
+      
+  _close1:
+              mov eax, 6 
+              mov ebx, [file1]
+              int 0x80
+              dbg
+      
+  _exit0: 
+              mov     ebx,0   ;first syscall argument: exit code
+              mov     eax,1   ;system call number (sys_exit)
+              int     0x80    ;call kernel
+      
+            ;; Error messages
+  _failopen1:     
+            mov edx,len1 ;third argument: message length
+            mov ecx,msg1 ;second argument: pointer to message to write
+            mov ebx,1   ;first argument: file handle (stdout)
+            mov eax,4   ;system call number (sys_write)
+            int 0x80    ;call kernel
+            jmp _exit0
+    
+  _failopen2:     
+            mov edx,len2 ;third argument: message length
+            mov ecx,msg2 ;second argument: pointer to message to write
+            mov ebx,1   ;first argument: file handle (stdout)
+            mov eax,4   ;system call number (sys_write)
+            int 0x80    ;call kernel
+            jmp _close1
+    
+  _failwrite:     
+            mov edx,len3 ;third argument: message length
+            mov ecx,msg3 ;second argument: pointer to message to write
+            mov ebx,1   ;first argument: file handle (stdout)
+            mov eax,4   ;system call number (sys_write)
+            int 0x80    ;call kernel
+            jmp _close2
+            
+  _failread:     
+            mov edx,len4 ;third argument: message length
+            mov ecx,msg4 ;second argument: pointer to message to write
+            mov ebx,1   ;first argument: file handle (stdout)
+            mov eax,4   ;system call number (sys_write)
+            int 0x80    ;call kernel
+            jmp _close2
+    
+  section .data                           ;section declaration
+    
+            msg1     db      "Fail to open file 1",0xa     ;our dear string
+            len1     equ     $ - msg1                 ;length of our dear string
+            msg2     db      "Fail to open file 2",0xa     ;our dear string
+            len2     equ     $ - msg2                 ;length of our dear string
+            msg3     db      "Fail to write to file",0xa     ;our dear string
+            len3     equ     $ - msg3                 ;length of our dear string
+            msg4     db      "Fail to read to file",0xa     ;our dear string
+            len4     equ     $ - msg4                 ;length of our dear string
+            msg5     db      "Debug",0xa     ;our dear string
+            len5     equ     $ - msg5                 ;length of our dear string
+    
+  section .bss
+      
+              buffer  resb 1 
+              file1   resb 4
+              file2   resb 4
+      
+    
+  
+#+end_src
+Now lets compile it by executing the following shell command:
+#+begin_src sh 
+  cd src
+  nasm -f elf64 filecopy.asm
+  ld -s -o filecopy filecopy.o
+  cd ..
+#+end_src
+
+#+results:
+
+In C¸ a similar filecopy function can be written as:
+#+srcname: filecopy_c 
+#+begin_src c :tangle src/filecopyc.c :noweb yes
+  #include <stdio.h>
+  
+  void filecopy(FILE *ifp, FILE *ofp)
+  {
+     int c;
+     while ((c = getc(ifp)) != EOF)
+        putc(c, ofp);
+  }
+  
+  int main(int argc, char *argv[])
+  {
+     FILE *fp_source;
+     FILE *fp_dest;
+     
+     if (argc == 3)
+     {
+        if (((fp_source = fopen(*++argv, "r")) != NULL) && ((fp_dest = fopen(*++argv, "w")) != NULL))
+        {
+           filecopy(fp_source, fp_dest);
+           return 0;
+        }
+        else
+        {
+           printf("can't open file(s)/n");
+        }
+     }
+     return 1;
+  }
+  
+#+end_src
+It can be compiled with:
+#+begin_src sh 
+  cd src
+  gcc -o filecopyc.out filecopyc.c
+  cd ..
+#+end_src
+  
+** Benchmarks
+It is interesting to compare size of the two binaries produced by the assembly
+code and the C code respectively. As well run a benchmark on a relatively large
+text file "test.txt" which is about 8.8mB. Test results are summarized below:  
+#+TBLNAME: filecopy-benchmark
+| Program   | Size of binary (bytes) | Real time (s) | User time (s) | System time (s) |
+|-----------+------------------------+---------------+---------------+-----------------|
+| filecopyc |                   7100 |         3.536 |         2.836 |           0.224 |
+| filecopy  |                    828 |        675.08 |        13.169 |         403.369 |
+|-----------+------------------------+---------------+---------------+-----------------|
+#+TBLFM: $3=11*60 + 15.08::$5=6*60+43.369
+What happened there! We try to limit the amount of system calls by modifying
+our code so that a buffer of maximum 8192 bytes are used. The code is listed 
+below. 
+
+#+srcname: filecopy2
+#+begin_src asm :tangle src/filecopy2.asm :noweb yes                                          
+  section .text                           ;section declaration
+      
+                                      ;we must export the entry point to the ELF linker or
+              global _start       ;loader. They conventionally recognize _start as their
+                                      ;entry point. Use ld -e foo to override the default.
+      
+  _start:
+              ;; Fist let's take care of the stack
+              pop ebx                                             ;argc 
+              ;; we check that the number of arguments are 2 (file1 file2), otherwise just exit (no error message sent).
+              cmp ebx, 2
+              je  _exit0                                          ;jump if equal
+              pop ebx                                             ;program name (irrelevant)
+              pop ebx                                             ; file 1
+              
+              ;; now open it
+              mov eax, 5                                          ;system call open
+              mov ecx, 0                                          ; O_RDONLY 
+              int 80h                                             ; call kernel
+      
+              ;; Now we need to check that the value returned in eax is valid (not negative)
+              ;; to do this we can use the TEST instruction basically performs an AND operation without modifying registers other than flag registers. By writing test eax, eax, the signed flag should be set if -1 was returned to eax.
+              test eax, eax
+              js   _failopen1                                         ;if signed - just exit
+              ;; otherwise ensure to save the file descriptor
+              mov [file1], eax
+              ;; Now we open the next file, with the same procedure
+              pop ebx                                             ; file 2
+              
+              ;; now open it
+              mov eax, 5                                          ;system call open
+              mov ecx, 1                                          ; O_WRONLY 
+              or  ecx, 100                                        ; O_CREAT
+              mov edx, 777                                        ; all permissions granted
+              int 80h                                             ; call kernel
+      
+              test eax, eax
+              js   _failopen2                                         ;if signed - just close the first file and exit
+              mov [file2], eax
+      
+  _filecopy:       
+            ;; read a character stream into a buffer
+            mov eax, 3 ; sys_read
+            mov ebx, [file1] ; file descriptor
+            mov ecx, buffer                                     ;buffer
+            mov edx, 8192 ;length of input stream accepted
+            int 0x80
+      
+            ;; Now eax contains the number of characters read, so if eax
+            ;; contains 0 we have copied the entire file and can exit
+            test eax, eax
+            js   _failread
+            jz   _close2
+            ;; write the character
+      
+            mov edx,eax ;third argument: message length
+            mov eax,4   ;system call number (sys_write)
+            mov ebx,[file2]   
+            mov ecx,buffer ;second argument: pointer to message to write
+            int 0x80    ;call kernel
+  
+            test eax, eax
+            js  _failwrite
+            jmp _filecopy              
+      
+  _close2:
+             mov eax, 6                                          ;sys_close
+             mov ebx, [file2]
+             int 0x80
+      
+  _close1:
+              mov eax, 6 
+              mov ebx, [file1]
+              int 0x80
+      
+  _exit0: 
+              mov     ebx,0   ;first syscall argument: exit code
+              mov     eax,1   ;system call number (sys_exit)
+              int     0x80    ;call kernel
+      
+            ;; Error messages
+  _failopen1:     
+            mov edx,len1 ;third argument: message length
+            mov ecx,msg1 ;second argument: pointer to message to write
+            mov ebx,1   ;first argument: file handle (stdout)
+            mov eax,4   ;system call number (sys_write)
+            int 0x80    ;call kernel
+            jmp _exit0
+    
+  _failopen2:     
+            mov edx,len2 ;third argument: message length
+            mov ecx,msg2 ;second argument: pointer to message to write
+            mov ebx,1   ;first argument: file handle (stdout)
+            mov eax,4   ;system call number (sys_write)
+            int 0x80    ;call kernel
+            jmp _close1
+    
+  _failwrite:     
+            mov edx,len3 ;third argument: message length
+            mov ecx,msg3 ;second argument: pointer to message to write
+            mov ebx,1   ;first argument: file handle (stdout)
+            mov eax,4   ;system call number (sys_write)
+            int 0x80    ;call kernel
+            jmp _close2
+            
+  _failread:     
+            mov edx,len4 ;third argument: message length
+            mov ecx,msg4 ;second argument: pointer to message to write
+            mov ebx,1   ;first argument: file handle (stdout)
+            mov eax,4   ;system call number (sys_write)
+            int 0x80    ;call kernel
+            jmp _close2
+    
+  section .data                           ;section declaration
+    
+            msg1     db      "Fail to open file 1",0xa     ;our dear string
+            len1     equ     $ - msg1                 ;length of our dear string
+            msg2     db      "Fail to open file 2",0xa     ;our dear string
+            len2     equ     $ - msg2                 ;length of our dear string
+            msg3     db      "Fail to write to file",0xa     ;our dear string
+            len3     equ     $ - msg3                 ;length of our dear string
+            msg4     db      "Fail to read to file",0xa     ;our dear string
+            len4     equ     $ - msg4                 ;length of our dear string
+            msg5     db      "Debug",0xa     ;our dear string
+            len5     equ     $ - msg5                 ;length of our dear string
+    
+  section .bss
+      
+              buffer  resb 8192  
+              file1   resb 4
+              file2   resb 4
+      
+    
+  
+#+end_src
+Now lets compile it by executing the following shell command:
+#+begin_src sh 
+  cd src
+  nasm -f elf64 filecopy2.asm
+  ld -s -o filecopy2 filecopy2.o
+  cd ..
+#+end_src
+
+#+TBLNAME: filecopy-benchmark2
+| Program   | Size of binary (bytes) | Real time (s) | User time (s) | System time (s) |
+|-----------+------------------------+---------------+---------------+-----------------|
+| filecopyc |                   7100 |         3.536 |         2.836 |           0.224 |
+| filecopy  |                    828 |        675.08 |        13.169 |         403.369 |
+| filecopy2 |                    736 |         0.233 |         0.004 |           0.144 |
+|-----------+------------------------+---------------+---------------+-----------------|
+We see a huge difference in performance! And we easily beat the C code this time.
+The lesson leared from this is that we should always try to optimize system calls!
+
+* SPL1 - 4 instructions
+The first program we shall write SPL1 is inspired by Frank Sergeant's 
+3 instruction forth for embedded systems work [[http://pygmy.utoh.org/3ins4th.html]].
+
+#+begin_src txt
+Repeat forever:
+  Read a byte (char) from standard input
+  If byte = 'f' [fetch from data space]
+    A. Fetch address from standard input
+    B. Fetch the byte from that address
+  Else If byte = 's' [store in data space]
+    A. Get address from standard input
+    B. Get byte from standard input
+    C. Store byte at that address
+  Else If byte = 'w' [write to code space]
+    A. Fetch address from standard input
+    B. Fetch byte from that address
+    C. Store the byte at that address
+  Else If byte = 'c' [call]
+    A. Get address from standard input
+    B. Jump to subroutine at that address
+  End If
+#+end_src
+
+The addresses we use will not be physical addresses, but instead we will define
+two arrays one for code-space and one for data-space. The distinction is strictly
+not necessary on an x86 platform, but we do it anyway to make the design more
+accessible to (modified) Harward architectures.
+As we learned from the filecopy benchmarks in the previous section, we should
+buffer our input to limt the number of system calls. We will do the same here,
+but this time we will implement a fifo (first in, first out), i.e a buffer with a read index
+and a write index. On top of that we will define a function *key* which basically
+gets the next character from that buffer and puts it on the stack, or if there
+are no available characters, then calls the kernel to get more.
+
+#+srcname: SPL1_1
+#+begin_src asm :tangle src/spl1.asm :noweb yes
+   ;CAUTION: the macro interferes with registers!
+   %macro    ok 0
+             mov edx,oklen ;third argument: message length
+             mov ecx,okmsg ;second argument: pointer to message to write
+             mov ebx,1   ;first argument: file handle (stdout)
+             mov eax,4   ;system call number (sys_write)
+             int 0x80    ;call kernel
+   %endmacro
+  
+   %define BUFFER_SIZE  10
+   section .text  progbits alloc exec write align=16                       ;section declaration
+   
+                                   ;we must export the entry point to the ELF linker or
+           global _start       ;loader. They conventionally recognize _start as their
+                                   ;entry point. Use ld -e foo to override the default.
+   
+   _start:
+          
+           mov     eax, buffer
+           ;write welcome message
+           mov     edx,len ;third argument: message length
+           mov     ecx,msg ;second argument: pointer to message to write
+           mov     ebx,1   ;first argument: file handle (stdout)
+           mov     eax,4   ;system call number (sys_write)
+           int     0x80    ;call kernel
+  
+           mov     eax, dataspace
+           mov     [eax], byte 'a'
+           mov     [eax + 1], byte 'b'
+           mov     [eax + 2], byte 'c'
+           mov     [eax + 3], byte 'd'
+           mov     [eax + 4], byte 'e'
+           mov     [eax + 5], byte 'f'
+           mov     [eax + 6], byte 'g'
+           mov     [eax + 7], byte 'h'
+           mov     [eax + 8], byte 'i'
+           mov     [eax + 9], byte 'j'
+   _loop:
+           ;first we need to get input
+           call    _key   ; returns character in al
+          
+           mov    ebx, 'f'
+           cmp   eax, ebx
+           je     _f
+  
+           mov    ebx, 's'
+           cmp   eax, ebx
+           je     _s
+  
+           mov    ebx, 'w'
+           cmp   eax, ebx
+           je     _w
+  
+           mov    ebx, 'c'
+           cmp   eax, ebx
+           je     _c
+  
+           jmp    _loop
+  
+   _f:
+           call  _key
+           sub   eax, 48
+           add   eax, dataspace
+           xor   ebx, ebx
+           mov   bl, [eax]
+           mov   [output], bl
+           call  _write
+           ok
+           jmp   _loop
+  
+   _s:
+           call  _key
+           sub   eax, 48
+           add   eax, dataspace
+           mov   ecx, eax    ; address
+           call  _key        ; get byte
+           mov   [ecx], byte al
+           ok
+           jmp   _loop
+   
+   _w:
+           call  _key
+           sub   eax, 48
+           mov   ecx, eax    ; address
+           add   ecx, codespace
+           call  _key        ; get byte
+           mov   [ecx], eax
+           ;ok
+           jmp   _loop
+   _c:
+           call  _key
+           sub   eax, 48
+           mov   ebx, eax    ; address
+           add   ebx, codespace
+           call  [ebx]
+           ;ok
+           jmp   _loop
+   _key:   
+           ;; Modifies; eax, ebx
+           ;; Check if we are out of input
+           mov     ebx, [readIndex]
+           cmp     ebx, [writeIndex]
+           jge     _read                                       ;jge = greater or equal
+           
+           xor     eax, eax  ; zero eax
+           mov     byte al, [ebx] ; get char
+           inc     ebx       ; increment read index 
+           mov     [readIndex], ebx
+          ;; We will ignore whitespace and lineshift characters
+           cmp     eax, 0x20                                   ;whitespace
+           je      _key
+           cmp     eax, 0x0a ;newline 
+           je      _key
+           ret
+   
+   _read:
+   
+           mov     eax, 3 ;sys_read
+           xor     ebx, ebx ;standard input file descriptor
+           mov     ecx, buffer
+           mov     edx, BUFFER_SIZE 
+           int     0x80   ; call kernel
+           ; check if read was valid
+           test    eax, eax
+           jbe     _exit0 ; note that we exit even if eax is 0 - therefore we exit on ^D
+            mov      ecx, buffer
+           mov     [readIndex], ecx 
+           add     ecx, eax
+           mov     [writeIndex], ecx
+           jmp     _key
+           
+  _write:
+           mov    edx, 1 ;length of output buffer in bytes
+           mov    ecx, output
+           mov    ebx, 1
+           mov    eax, 4
+           int    0x80
+           ;check for errors
+           test   eax, eax
+           js     _exit0
+           ret 
+   _exit0:
+           mov     ebx,0   ;first syscall argument: exit code
+           mov     eax,1   ;system call number (sys_exit)
+           int     0x80    ;call kernel
+   
+           codespace dd 10
+   section .data                           ;section declaration
+           align   4
+           readIndex dd buffer
+           writeIndex dd buffer
+           msg     db      "Welcome to SPL1:",0xa     
+           len     equ     $ - msg                 
+           okmsg     db      0xa,"Ok",0xa     
+           oklen     equ     $ -okmsg                
+     
+  
+   section .bss
+           buffer    resb BUFFER_SIZE
+           output    resb 4
+           dataspace resb 10
+  
+#+end_src
+
+Now let's compile it by executing the following shell command:
+#+begin_src sh 
+  cd src
+  nasm -f elf64 spl1.asm
+  ld -s -o spl1 spl1.o
+  cd ..
+#+end_src
+
+The instructions 'f' and 's' have been tested, but 
+'w' and 'c' have not. I currently don't know how, nor
+have the energy to figure out, how to make a decent test code
+for this.
+
+* A stack based calculator
+The previous example showed us a simple interpreter. We will expand on this
+by writing a simple stack based calculator that works with integers and
+support the operations '+', '-', '*' and '/'. 
+For example we would like to write;
+#+begin_src forth
+12 3 5 * -
+#+end_src
+and receive 
+#+begin_src forth
+31
+#+end_src
+We will write this application in an extendible way to illustrate several 
+key aspects of a FORTH interpreter. These are
+- working with stacks
+- indirect threading
+- tokenizing input
+- the dictionary
+- lookup in dictionary
+- working with numbers
+
+Generally, what the interpreter will do is to repeat the following loop:
+- buffer input from stdin 
+- tokenize the input with respect to whitespace or newline 
+- lookup the token in a dictionary
+- if found; execute the word in the dictionary (get arguments from the stack)
+- if not found: try to interpret token as number and put it on the stack
+
+The implementation of the dictionary will be in terms of a linked
+list, where each entry are of the following form:
+
+#+begin_ditaa dict.png -r -o -S
++--------------+----------------+---------+----------+-------------+
+| Name         | Length (flags) | Link    | Codeword | Definition  |
++--------------+----------------+---------+----------+-------------+
+| (4n-1) bytes | 1 byte         | address | address  | m addresses |
+|              |                |         |          |             |
++--------------+-----------------+--------+----------+-------------+
+#+end_ditaa
+The dictionary needs to be padded to 32-bit boundary.
+The link field points at the link field of the previous entry.
+A variable called *latest* points at the the link field of the last
+word in the dictionary.
+
+What is the codeword and the definition? The definition is basically
+an array of addresses to code snippets which we want to execute. In this
+specific case each primitive could end by a jmp to the main loop, but we want
+to be a bit foresighted and not hardcode the exit point of each primitive. This
+is where indirect threading comes in. We will explain what happens by an example. 
+Suppose we have our calculator application working, and enter the command 
+*12 2 + * into the terminal. The two numbers will be put on the stack, and 
+the word '+' will be found in the dictionary. The next thing we want to do 
+is to jump to the code performing the + operation. But before we do that we 
+need to decide where to jump to after the primitive has performed its desired 
+function. This is basically what is done by the call/ret instructions as well,
+but we want to do this manually.
+To keep the exit points of jump locations arbitrary, we introduce a mechanism
+for indirection by adding an interpreter pointer and a return stack. 
+The interpreter pointer points at the code to be executed next. The return 
+stack is used for storing exit points after, for example, a jump to +. 
+Every thing is kept together by the assembler macro *next*, which basically 
+executes the next instruction pointed to by the interpreter pointer.
+
+Before we implement the word *next*,  we need to make some decisions about
+the use of machine registers, and setup a data stack and a return stack. 
+
+** Assignment of registers
+
+|----------+-------------------------|
+| Register | Use                     |
+|----------+-------------------------|
+| rax      | working register  (W)   |
+| rbx      | unused                  |
+| rcx      | unused                  |
+| rdx      | top of data stack 
+| rbx      | unused                  |
+| rsp      | data stack pointer      |
+| rbp      | top of return stack     |
+| rsi      | interpreter pointer     |
+| rdi      | working register 2 (X)  |
+|----------+-------------------------|
+
+** Setting up the stacks
+The first thing we must do is to be able to manipulate the stacks. Note that 
+we use the regular (linux) stack as data stack, hence we do not need to set 
+it up. We can use the assembly instructions *push* and *pop* to directly.
+The return stack, however, we need to set up, and we have to write push and 
+pop instructions for it. We delay the initialization of the return stack for 
+now, but we write macros for push and pop:
+#+begin_src asm :tangle /src/calc.asm :noweb yes
+  %macro rpush 1
+          lea rpb, [rpb-8]        ;move stack pointer to next free cell
+          mov [rpb], 1            ;move contents of 1 into address of epb
+
+
+  %macro  rpop 1
+          mov 1, [rpb]             ;move top of stack into 1
+          lea epb, [rpb+8]         ;move stack pointer
+  %endmacro
+#+end_src
+Note that this code implies that the return stack grow towards lower
+address space. 
+
+The instruction *lea* is short hand for 'load effective address', and the 
+instruction *lea epb, [epb+4]* basically loads the address (not the contents of the
+address) epb+4(bytes) into epb.
+
+** The inner interpreter
+#+begin_src asm :tangle /src/calc.asm :noweb yes
+  %macro  next 0
+          lodsd                   ;eax=[ds:esi], esi +-=4 
+          mov edi, [eax] 
+          jmp [edi]
+  %endmacro
+#+end_src
+Note that lodsd increments ed:esi if direction flag is set, and decrements if
+it is not set.   
+
+#+begin_src asm :tangle /src/calc.asm :noweb yes
+  enter: 
+          rpush esi
+          add   eax,4
+          mov   esi, eax
+          next
+#+end_src
+
+Retrieving the interpreter pointer from the return stack is done with *exit*.
+#+begin_src asm :tangle /src/calc.asm :noweb yes
+  exit:
+          rpop esi
+          next
+#+end_src
